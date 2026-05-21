@@ -30,7 +30,7 @@ public:
     void start() {
         ws_.async_accept([self = shared_from_this()](beast::error_code ec) {
             if (ec) return;
-            std::cout << "[L2] Frontend подключен" << std::endl;
+            std::cout << "[L2] Frontend connect" << std::endl;
             self->do_read_ws();
         });
     }
@@ -39,7 +39,7 @@ private:
     void do_read_ws() {
         ws_.async_read(ws_buffer_, [self = shared_from_this()](beast::error_code ec, std::size_t bytes) {
             if (ec) {
-                std::cout << "[L2] Frontend отключился: " << ec.message() << std::endl;
+                std::cout << "[L2] Frontend disconnect: " << ec.message() << std::endl;
                 return;
             }
 
