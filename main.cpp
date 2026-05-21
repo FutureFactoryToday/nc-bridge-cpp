@@ -39,21 +39,32 @@ private:
     void do_read_ws() {
         ws_.async_read(ws_buffer_, [self = shared_from_this()](beast::error_code ec, std::size_t bytes) {
             if (ec) {
-                std::cout << "[L2] Frontend отключился" << std::endl;
+                std::cout << "[L2] Frontend отключился: " << ec.message() << std::endl;
                 return;
             }
+
+            // 1. Получаем строку
             std::string msg = beast::buffers_to_string(self->ws_buffer_.data());
             self->ws_buffer_.consume(bytes);
 
+            // 2. Добавляем терминатор (CR)
             if (!msg.empty() && msg.back() != '\r') msg += "\r";
 
+            // 3. СИНХРОННАЯ ЗАПИСЬ (Гарантирует уход в L1 без зависаний)
             if (self->sm_.port.is_open()) {
-                std::cout << "[L3 -> L1] " << msg;
-                net::async_write(self->sm_.port, net::buffer(msg), [](beast::error_code, std::size_t){});
+                try {
+                    std::cout << "[L3 -> L1] Отправка: " << msg;
+                    boost::asio::write(self->sm_.port, boost::asio::buffer(msg));
+                } catch (std::exception& e) {
+                    std::cerr << "Ошибка записи в порт: " << e.what() << std::endl;
+                }
             }
+
+            // Продолжаем слушать
             self->do_read_ws();
         });
     }
+
 };
 
 // Сервер
