@@ -4,28 +4,21 @@
 #include <iostream>
 #include <string>
 #include <memory>
-#include <termios.h> // Для низкоуровневой очистки порта
 
 namespace net = boost::asio;
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
 using tcp = net::ip::tcp;
 
+// Класс-менеджер порта
 class SerialManager {
 public:
     net::serial_port port;
-    char read_buf[1024];
-    
+    char read_buf;
     SerialManager(net::io_context& ioc) : port(ioc) {}
-
-    // Метод для очистки системных буферов порта
-    void flush() {
-        if (port.is_open()) {
-            tcflush(port.lowest_layer().native_handle(), TCIOFLUSH);
-        }
-    }
 };
 
+// Сессия связи с браузером
 class CncSession : public std::enable_shared_from_this<CncSession> {
     websocket::stream<tcp::socket> ws_;
     SerialManager& sm_;
@@ -35,12 +28,9 @@ public:
     CncSession(tcp::socket socket, SerialManager& sm) : ws_(std::move(socket)), sm_(sm) {}
 
     void start() {
-        // При новом подключении — чистим порт от старых "хвостов"
-        sm_.flush();
-        
         ws_.async_accept([self = shared_from_this()](beast::error_code ec) {
             if (ec) return;
-            std::cout << "[L2] Клиент подключен. Порт очищен." << std::endl;
+            std::cout << "[L2] Frontend подключен" << std::endl;
             self->do_read_ws();
         });
     }
@@ -49,28 +39,24 @@ private:
     void do_read_ws() {
         ws_.async_read(ws_buffer_, [self = shared_from_this()](beast::error_code ec, std::size_t bytes) {
             if (ec) {
-                std::cout << "[L2] Клиент ушел." << std::endl;
+                std::cout << "[L2] Frontend отключился" << std::endl;
                 return;
             }
-
             std::string msg = beast::buffers_to_string(self->ws_buffer_.data());
             self->ws_buffer_.consume(bytes);
 
-            // Гарантируем \r
             if (!msg.empty() && msg.back() != '\r') msg += "\r";
 
             if (self->sm_.port.is_open()) {
-                // Используем async_write вместо синхронного write для порта
-                net::async_write(self->sm_.port, net::buffer(msg), 
-                    [msg](boost::system::error_code ec_w, std::size_t) {
-                        if (!ec_w) std::cout << "[L3 -> L1] Отправлено: " << msg;
-                    });
+                std::cout << "[L3 -> L1] " << msg;
+                net::async_write(self->sm_.port, net::buffer(msg), [](beast::error_code, std::size_t){});
             }
             self->do_read_ws();
         });
     }
 };
 
+// Сервер
 class CncServer {
     tcp::acceptor acceptor_;
     SerialManager& sm_;
@@ -84,51 +70,44 @@ public:
 private:
     void do_accept() {
         acceptor_.async_accept([this](beast::error_code ec, tcp::socket socket) {
-            if (!ec) {
-                std::make_shared<CncSession>(std::move(socket), sm_)->start();
-            }
+            if (!ec) std::make_shared<CncSession>(std::move(socket), sm_)->start();
             do_accept();
         });
     }
 };
 
-// Функция чтения порта, которая никогда не останавливается
+// Постоянное чтение порта
 void start_serial_reading(std::shared_ptr<SerialManager> sm) {
-    sm->port.async_read_some(net::buffer(sm->read_buf), 
-        [sm](boost::system::error_code ec, std::size_t n) {
-            if (!ec && n > 0) {
-                // Данные от STM32 можно выводить в консоль для отладки
-                // std::cout << "[L1 -> L2]: " << std::string(sm->read_buf, n) << std::endl;
-            }
-            start_serial_reading(sm);
-        });
+    sm->port.async_read_some(net::buffer(&(sm->read_buf), 1), [sm](beast::error_code ec, std::size_t n) {
+        if (!ec) {
+            // Сюда можно добавить отправку данных в WebSocket, если нужно
+        }
+        start_serial_reading(sm);
+    });
 }
 
 int main() {
     try {
         net::io_context ioc;
-        auto sm = std::make_shared<SerialManager>(ioc);
+        
+        // --- ВОТ ЭТО РЕШАЕТ ПРОБЛЕМУ ---
+        // work_guard не дает ioc.run() завершиться, даже когда нет задач
+        auto work_guard = net::make_work_guard(ioc);
 
+        auto sm = std::make_shared<SerialManager>(ioc);
         boost::system::error_code ec;
         sm->port.open("/dev/ttyACM0", ec);
-        if (ec) {
-            std::cerr << "ОШИБКА ПОРТА: " << ec.message() << std::endl;
-            return 1;
+        if (!ec) {
+            sm->port.set_option(net::serial_port_base::baud_rate(9600));
+            start_serial_reading(sm);
+        } else {
+            std::cerr << "Предупреждение: Порт не найден, но сервер запущен." << std::endl;
         }
 
-        // Настройка порта
-        sm->port.set_option(net::serial_port_base::baud_rate(9600));
-        sm->port.set_option(net::serial_port_base::flow_control(net::serial_port_base::flow_control::none));
-        sm->port.set_option(net::serial_port_base::parity(net::serial_port_base::parity::none));
-        sm->port.set_option(net::serial_port_base::stop_bits(net::serial_port_base::stop_bits::one));
-
         CncServer server(ioc, *sm);
-        start_serial_reading(sm);
+        std::cout << "[L2] Демон активен. Нажмите Ctrl+C для выхода." << std::endl;
 
-        std::cout << "[L2] Демон готов. Ожидание L3..." << std::endl;
-        
-        // Запускаем ioc в нескольких потоках для стабильности (опционально)
-        // Но для начала хватит и одного
+        // Теперь ioc.run() будет работать ВЕЧНО
         ioc.run();
 
     } catch (std::exception const& e) {
