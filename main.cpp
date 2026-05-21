@@ -6,129 +6,59 @@
 #include <string>
 #include <memory>
 
-namespace beast = boost::beast;
-namespace websocket = beast::websocket;
-namespace net = boost::asio;
-using tcp = boost::asio::ip::tcp;
+// 1. Делаем класс для работы с портом отдельно (Синглтон)
+class SerialConnection {
+public:
+    net::serial_port port;
+    SerialConnection(net::io_context& ioc) : port(ioc) {}
+};
 
 class CncBridge : public std::enable_shared_from_this<CncBridge> {
     websocket::stream<tcp::socket> ws_;
-    net::serial_port serial_; // Объект порта возвращен
+    SerialConnection& serial_conn_; // Ссылка на общий порт
     beast::flat_buffer buffer_;
-    char serial_buf_[1024];    // Буфер для чтения из Serial
+    char serial_buf_[1024];
 
 public:
-    // В конструктор добавляем инициализацию serial_ через io_context сокета
-    explicit CncBridge(tcp::socket socket) 
-        : ws_(std::move(socket)), 
-          serial_(ws_.get_executor()) {}
+    CncBridge(tcp::socket socket, SerialConnection& sc) 
+        : ws_(std::move(socket)), serial_conn_(sc) {}
 
-    void run(std::string dev_path) {
-        // --- СЕКЦИЯ ПОДКЛЮЧЕНИЯ К ЖЕЛЕЗУ (L1) ---
-        if(serial_.is_open())
-        {
-            serial_.close();
-        }
-         
-        boost::system::error_code ec;
-        serial_.open(dev_path, ec);
-
-        if (!ec) 
-        {
-            serial_.set_option(net::serial_port_base::baud_rate(9600));
-            serial_.set_option(net::serial_port_base::flow_control(net::serial_port_base::flow_control::none));
-            std::cout << "[L2] Успешно подключено к " << dev_path << std::endl;
-            do_read_serial(); // Запуск чтения из железа
-        }
-        else 
-        {
-            std::cout << "[L2] Предупреждение: Порт не открыт (" << ec.message() << ")" << std::endl;
-        }
-        
-
+    void run() {
         ws_.accept();
-        std::cout << "[L2] Frontend подключен. Режим отладки (Loopback) активен." << std::endl;
+        std::cout << "[L2] Клиент подключен к общему порту." << std::endl;
         do_read_ws();
+        do_read_serial(); // Начинаем слушать порт для этого клиента
     }
 
 private:
-    // Чтение из Браузера (L3) -> Запись в Железо (L1) или Loopback
     void do_read_ws() {
-        ws_.async_read(buffer_, [self = shared_from_this()](beast::error_code ec, std::size_t bytes) 
-        {
-
-            if(ec) 
-            {
-                std::cout << "[L2] WebSocket closed: " << ec.message() << std::endl;
-                if(self->serial_.is_open()){
-                    self->serial_.close();
-                }
-
-                return;
-            }
+        ws_.async_read(buffer_, [self = shared_from_this()](beast::error_code ec, std::size_t bytes) {
+            if (ec) return; // Просто выходим при дисконнекте
 
             std::string msg = beast::buffers_to_string(self->buffer_.data());
             self->buffer_.consume(bytes);
 
-            if(!msg.empty() && msg.back() != '\r')
-            {
-                msg += "\r";
-            }               
+            if (!msg.empty() && msg.back() != '\r') msg += "\r";
 
-            if (self->serial_.is_open()) 
-            {
-                std::cout << "[L3 -> L1] Send:" << msg;
-                net::write(self->serial_, net::buffer(msg));
+            // Пишем в ОБЩИЙ порт
+            if (self->serial_conn_.port.is_open()) {
+                std::cout << "[L3 -> L1] " << msg;
+                net::write(self->serial_conn_.port, net::buffer(msg));
             }
-
             self->do_read_ws();
-
-            // if(!ec) 
-            // {
-            //     std::string msg = beast::buffers_to_string(self->buffer_.data());
-            //     self->buffer_.consume(bytes);
-            //     std::cout << "[L3 -> L2] Команда: " << msg << std::endl;
-
-            //     if(!msg.empty())
-            //     {
-            //         if(msg.back() != '\n' && msg.back() != '\r')
-            //         {
-            //             msg += "\r";
-            //         }
-            //     }
-
-            //     // Если порт открыт — отправляем в mcu
-            //     if (self->serial_.is_open()) 
-            //     {
-            //         std::cout << "[L3 -> L1] Send:" << msg;
-            //         net::write(self->serial_, net::buffer(msg));
-            //     }
-
-            //     self->do_read_ws();
-
-            //     // --- LOOPBACK ЭМУЛЯЦИЯ ---
-            //     // Отправляем эхо назад во фронтенд
-            //     /*self->ws_.text(self->ws_.got_text());
-            //     self->ws_.async_write(self->buffer_.data(), [self](beast::error_code ec, std::size_t) {
-            //         self->buffer_.consume(self->buffer_.size());
-            //         if (!ec) self->do_read_ws();
-            //     });*/
-            // }
-
         });
     }
 
-    // Чтение из Железа (L1) -> Запись в Браузер (L3)
     void do_read_serial() {
-        serial_.async_read_some(net::buffer(serial_buf_), 
+        serial_conn_.port.async_read_some(net::buffer(serial_buf_), 
             [self = shared_from_this()](boost::system::error_code ec, std::size_t n) {
-            if (!ec) {
-                // Пересылаем данные из порта в WebSocket
-                std::string data(self->serial_buf_, n);
-                self->ws_.async_write(net::buffer(data), [self](beast::error_code ec, std::size_t) {
-                    if (!ec) self->do_read_serial();
-                });
-            }
+            if (ec) return; // Если порт закроется в main, мы выйдем отсюда
+            
+            std::string data(self->serial_buf_, n);
+            self->ws_.text(true);
+            self->ws_.async_write(net::buffer(data), [self](beast::error_code ec, std::size_t) {
+                if (!ec) self->do_read_serial();
+            });
         });
     }
 };
@@ -136,21 +66,32 @@ private:
 int main() {
     try {
         net::io_context ioc;
-        tcp::acceptor acceptor{ioc, {net::ip::make_address("0.0.0.0"), 8080}};
         
-        std::cout << "C++ L2-Daemon (Hybrid: Loopback/Serial ready)" << std::endl;
+        // 2. ОТКРЫВАЕМ ПОРТ ОДИН РАЗ ЗДЕСЬ (при старте программы)
+        SerialConnection sc(ioc);
+        boost::system::error_code ec;
+        sc.port.open("/dev/ttyACM0", ec);
+        if (ec) {
+            std::cerr << "Критическая ошибка порта: " << ec.message() << std::endl;
+            return 1;
+        }
+        sc.port.set_option(net::serial_port_base::baud_rate(9600));
 
-        while (true) {
-            tcp::socket socket{ioc};
+        tcp::acceptor acceptor{ioc, {net::ip::make_address("0.0.0.0"), 8080}};
+        std::cout << "L2 запущен. Порт открыт навсегда. Ожидание L3..." << std::endl;
+
+        for (;;) {
+            tcp::socket socket(ioc);
             acceptor.accept(socket);
-            // Передаем путь к устройству (пока закомментировано внутри)
-            std::make_shared<CncBridge>(std::move(socket))->run("/dev/ttyACM0");
+            
+            // Запускаем сессию, передавая ссылку на уже открытый порт
+            std::make_shared<CncBridge>(std::move(socket), sc)->run();
+            
             ioc.run();
             ioc.restart(); 
-            std::cout << "[L2] missed" << std::endl;
+            std::cout << "[L2] Сессия завершена. Порт остается открытым." << std::endl;
         }
     } catch (std::exception const& e) {
-        std::cerr << "Fatal Error: " << e.what() << std::endl;
+        std::cerr << "Error: " << e.what() << std::endl;
     }
-    return 0;
 }
