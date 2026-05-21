@@ -25,17 +25,26 @@ public:
 
     void run(std::string dev_path) {
         // --- СЕКЦИЯ ПОДКЛЮЧЕНИЯ К ЖЕЛЕЗУ (L1) ---
-        /* 
+        if(serial_.is_open())
+        {
+            serial_.close();
+        }
+         
         boost::system::error_code ec;
         serial_.open(dev_path, ec);
-        if (!ec) {
-            serial_.set_option(net::serial_port_base::baud_rate(115200));
+
+        if (!ec) 
+        {
+            serial_.set_option(net::serial_port_base::baud_rate(9600));
+            serial_.set_option(net::serial_port_base::flow_control(net::serial_port_base::flow_control::none));
             std::cout << "[L2] Успешно подключено к " << dev_path << std::endl;
             do_read_serial(); // Запуск чтения из железа
-        } else {
+        }
+        else 
+        {
             std::cout << "[L2] Предупреждение: Порт не открыт (" << ec.message() << ")" << std::endl;
         }
-        */
+        
 
         ws_.accept();
         std::cout << "[L2] Frontend подключен. Режим отладки (Loopback) активен." << std::endl;
@@ -45,24 +54,67 @@ public:
 private:
     // Чтение из Браузера (L3) -> Запись в Железо (L1) или Loopback
     void do_read_ws() {
-        ws_.async_read(buffer_, [self = shared_from_this()](beast::error_code ec, std::size_t bytes) {
-            if (!ec) {
-                std::string msg = beast::buffers_to_string(self->buffer_.data());
-                std::cout << "[L3 -> L2] Команда: " << msg << std::endl;
+        ws_.async_read(buffer_, [self = shared_from_this()](beast::error_code ec, std::size_t bytes) 
+        {
 
-                // Если порт открыт — отправляем в станок
-                if (self->serial_.is_open()) {
-                    net::write(self->serial_, net::buffer(msg));
+            if(ec) 
+            {
+                std::cout << "[L2] WebSocket closed: " << ec.message() << std::endl;
+                if(self->serial_.is_open()){
+                    self->serial_.close();
                 }
 
-                // --- LOOPBACK ЭМУЛЯЦИЯ ---
-                // Отправляем эхо назад во фронтенд
-                self->ws_.text(self->ws_.got_text());
-                self->ws_.async_write(self->buffer_.data(), [self](beast::error_code ec, std::size_t) {
-                    self->buffer_.consume(self->buffer_.size());
-                    if (!ec) self->do_read_ws();
-                });
+                return;
             }
+
+            std::string msg = beast::buffers_to_string(self->buffer_.data());
+            self->buffer_.consume(bytes);
+
+            if(!msg.empty() && msg.back() != '\r')
+            {
+                msg += "\r";
+            }               
+
+            if (self->serial_.is_open()) 
+            {
+                std::cout << "[L3 -> L1] Send:" << msg;
+                net::write(self->serial_, net::buffer(msg));
+            }
+
+            self->do_read_ws();
+
+            // if(!ec) 
+            // {
+            //     std::string msg = beast::buffers_to_string(self->buffer_.data());
+            //     self->buffer_.consume(bytes);
+            //     std::cout << "[L3 -> L2] Команда: " << msg << std::endl;
+
+            //     if(!msg.empty())
+            //     {
+            //         if(msg.back() != '\n' && msg.back() != '\r')
+            //         {
+            //             msg += "\r";
+            //         }
+            //     }
+
+            //     // Если порт открыт — отправляем в mcu
+            //     if (self->serial_.is_open()) 
+            //     {
+            //         std::cout << "[L3 -> L1] Send:" << msg;
+            //         net::write(self->serial_, net::buffer(msg));
+            //     }
+
+            //     self->do_read_ws();
+
+            //     // --- LOOPBACK ЭМУЛЯЦИЯ ---
+            //     // Отправляем эхо назад во фронтенд
+            //     /*self->ws_.text(self->ws_.got_text());
+            //     self->ws_.async_write(self->buffer_.data(), [self](beast::error_code ec, std::size_t) {
+            //         self->buffer_.consume(self->buffer_.size());
+            //         if (!ec) self->do_read_ws();
+            //     });*/
+            // }
+
         });
     }
 
@@ -84,7 +136,7 @@ private:
 int main() {
     try {
         net::io_context ioc;
-        tcp::acceptor acceptor{ioc, {net::ip::make_address("127.0.0.1"), 8080}};
+        tcp::acceptor acceptor{ioc, {net::ip::make_address("0.0.0.0"), 8080}};
         
         std::cout << "C++ L2-Daemon (Hybrid: Loopback/Serial ready)" << std::endl;
 
@@ -95,6 +147,7 @@ int main() {
             std::make_shared<CncBridge>(std::move(socket))->run("/dev/ttyACM0");
             ioc.run();
             ioc.restart(); 
+            std::cout << "[L2] missed" << std::endl;
         }
     } catch (std::exception const& e) {
         std::cerr << "Fatal Error: " << e.what() << std::endl;
