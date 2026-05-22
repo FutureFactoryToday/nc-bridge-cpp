@@ -1,31 +1,26 @@
-# Указываем минимальную версию CMake
 cmake_minimum_required(VERSION 3.10)
-
-# Название проекта
 project(nc-bridge-cpp)
 
-# Устанавливаем стандарт C++ (Boost.Beast требует минимум C++11, но лучше 14 или 17)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Поиск пакета Boost
-# Нам нужны компоненты system (базовый) и thread
-find_package(Boost REQUIRED COMPONENTS system thread)
+# Поиск Boost (компонент thread в новых версиях часто встроен в headers-only, 
+# но для надежности оставим system)
+find_package(Boost REQUIRED COMPONENTS system)
 
-# Проверка: если Boost найден, добавляем пути к заголовкам
-if(Boost_FOUND)
-    include_directories(${Boost_INCLUDE_DIRS})
-endif()
-
-# Создаем исполняемый файл из исходника main.cpp
 add_executable(nc_bridge_cpp main.cpp)
 
-# Привязываем библиотеки Boost и системную библиотеку потоков pthread
+# Подключаем заголовки и линкуем библиотеки
 target_link_libraries(nc_bridge_cpp 
-    ${Boost_LIBRARIES}
-    pthread
+    PRIVATE 
+    Boost::system
 )
 
-# Дополнительно: выводим сообщение о статусе для отладки
-message(STATUS "Boost include dirs: ${Boost_INCLUDE_DIRS}")
+# Для Linux добавляем pthread, для Windows — системные библиотеки сокетов
+if(UNIX)
+    target_link_libraries(nc_bridge_cpp PRIVATE pthread)
+else()
+    # Windows требует ws2_32 и mswsock для работы с сетью в Boost.Asio
+    target_link_libraries(nc_bridge_cpp PRIVATE ws2_32 mswsock)
+endif()
 message(STATUS "Boost libraries: ${Boost_LIBRARIES}")

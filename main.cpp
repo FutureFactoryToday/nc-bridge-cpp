@@ -87,6 +87,7 @@ private:
     }
 };
 
+
 // Постоянное чтение порта
 void start_serial_reading(std::shared_ptr<SerialManager> sm) {
     sm->port.async_read_some(net::buffer(&(sm->read_buf), 1), [sm](beast::error_code ec, std::size_t n) {
@@ -97,32 +98,66 @@ void start_serial_reading(std::shared_ptr<SerialManager> sm) {
     });
 }
 
+std::string find_available_port(net::io_context& ioc) {
+    std::vector<std::string> port_names;
+
+    #ifdef _WIN32
+        // В Windows перебираем COM-порты от 1 до 20
+        for (int i = 1; i <= 20; ++i) {
+            port_names.push_back("COM" + std::to_string(i));
+        }
+    #else
+        // В Linux проверяем стандартные имена для USB-Serial адаптеров
+        for (int i = 0; i < 5; ++i) {
+            port_names.push_back("/dev/ttyACM" + std::to_string(i));
+            port_names.push_back("/dev/ttyUSB" + std::to_string(i));
+        }
+    #endif
+
+    for (const auto& name : port_names) {
+        try {
+            net::serial_port port(ioc);
+            port.open(name);
+            if (port.is_open()) {
+                port.close();
+                return name; // Нашли рабочий порт!
+            }
+        } catch (...) {
+            continue; // Порт занят или не существует, идем дальше
+        }
+    }
+    return ""; // Ничего не нашли
+}
+
 int main() {
     try {
         net::io_context ioc;
-        
-        // --- ВОТ ЭТО РЕШАЕТ ПРОБЛЕМУ ---
-        // work_guard не дает ioc.run() завершиться, даже когда нет задач
         auto work_guard = net::make_work_guard(ioc);
-
         auto sm = std::make_shared<SerialManager>(ioc);
-        boost::system::error_code ec;
-        sm->port.open("/dev/ttyACM0", ec);
-        if (!ec) {
-            sm->port.set_option(net::serial_port_base::baud_rate(9600));
-            start_serial_reading(sm);
+
+        // --- АВТОМАТИЧЕСКИЙ ПОИСК ПОРТА ---
+        std::string port_name = find_available_port(ioc);
+
+        if (port_name.empty()) {
+            std::cerr << "!!! ОШИБКА: Ни один подходящий последовательный порт не найден." << std::endl;
+            // Можно либо выйти, либо продолжить работу сервера без порта
         } else {
-            std::cerr << "Предупреждение: Порт не найден, но сервер запущен." << std::endl;
+            boost::system::error_code ec;
+            sm->port.open(port_name, ec);
+            if (!ec) {
+                sm->port.set_option(net::serial_port_base::baud_rate(9600));
+                start_serial_reading(sm);
+                std::cout << "[L1] Успешно подключено к: " << port_name << std::endl;
+            }
         }
 
         CncServer server(ioc, *sm);
-        std::cout << "[L2] Демон активен. Нажмите Ctrl+C для выхода." << std::endl;
+        std::cout << "[L2] WebSocket сервер запущен на порту 8080." << std::endl;
 
-        // Теперь ioc.run() будет работать ВЕЧНО
         ioc.run();
 
     } catch (std::exception const& e) {
-        std::cerr << "FATAL: " << e.what() << std::endl;
+        std::cerr << "FATAL ERROR: " << e.what() << std::endl;
     }
     return 0;
 }
