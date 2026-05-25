@@ -1,6 +1,8 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/asio.hpp>
+#include <chrono>
+#include <thread>
 #include <iostream>
 #include <string>
 #include <memory>
@@ -53,10 +55,10 @@ private:
             // 3. СИНХРОННАЯ ЗАПИСЬ (Гарантирует уход в L1 без зависаний)
             if (self->sm_.port.is_open()) {
                 try {
-                    std::cout << "[L3 -> L1] Отправка: " << msg;
+                    std::cout << "[L3 -> L1] Dispatch: " << msg;
                     boost::asio::write(self->sm_.port, boost::asio::buffer(msg));
                 } catch (std::exception& e) {
-                    std::cerr << "Ошибка записи в порт: " << e.what() << std::endl;
+                    std::cerr << "Error writing to port: " << e.what() << std::endl;
                 }
             }
 
@@ -102,7 +104,7 @@ std::string find_available_port(net::io_context& ioc) {
     std::vector<std::string> port_names;
 
     #ifdef _WIN32
-        // В Windows перебираем COM-порты от 1 до 20
+        //В Windows перебираем COM-порты от 1 до 20
         for (int i = 1; i <= 20; ++i) {
             port_names.push_back("COM" + std::to_string(i));
         }
@@ -114,19 +116,62 @@ std::string find_available_port(net::io_context& ioc) {
         }
     #endif
 
+    std::cout << "[L1] Scanning..." << std::endl;
+
     for (const auto& name : port_names) {
         try {
             net::serial_port port(ioc);
             port.open(name);
-            if (port.is_open()) {
-                port.close();
-                return name; // Нашли рабочий порт!
-            }
+            port.set_option(net::serial_port_base::baud_rate(9600)); // Настройка не важна, просто для открытия
+
+            // 1. Отправляем запрос
+            std::string request = "$A-Y-CS25?\r\n";
+            net::write(port, net::buffer(request));
+
+            // 2. Ждем чуть-чуть, чтобы электричество добежало до станка и обратно
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+            // 3. ПРОВЕРКА БУФЕРА (Windows-специфично)
+            #ifdef _WIN32
+                DWORD errors;
+                COMSTAT status;
+                // Спрашиваем у Windows: "Пришли ли байты в этот порт?"
+                if (ClearCommError(port.native_handle(), &errors, &status)) {
+                    if (status.cbInQue > 0) {
+                        // Байты есть! Читаем их
+                        char data[256]; 
+                        boost::system::error_code read_ec;
+                        size_t n = port.read_some(net::buffer(data), read_ec);
+                        
+                        if (!read_ec && n > 0) {
+                            std::string response(data, n);
+                            std::cout << "[L1] Checking " << name << ": Recieved: " << response << std::endl;
+                            
+                            if (response.find("$CS-25OK") != std::string::npos) {
+                                port.close();
+                                return name; 
+                            }
+                        }
+                    } else {
+                        // Буфер пуст — не ждем ни секунды, идем к следующему порту
+                        std::cout << "[L1] Checking " << name << ": Buffer is EMPTY" << std::endl;
+                    }
+                }
+            #endif
+
+            port.close();
         } catch (...) {
-            continue; // Порт занят или не существует, идем дальше
+            // Если порт занят или не открывается — просто пропускаем
+            continue; 
         }
+
     }
-    return ""; // Ничего не нашли
+
+    // --- ВОТ ЭТО СООБЩЕНИЕ ---
+    std::cerr << "[L2] ERROR: The device with the ID $CS-25OK was NOT FOUND on any port!" << std::endl;
+    std::cerr << "[L2] Check the power and USB connection." << std::endl;
+    
+    return ""; 
 }
 
 int main() {
@@ -139,20 +184,24 @@ int main() {
         std::string port_name = find_available_port(ioc);
 
         if (port_name.empty()) {
-            std::cerr << "!!! ОШИБКА: Ни один подходящий последовательный порт не найден." << std::endl;
+            std::cerr << "!!! ERROR: No suitable serial port found." << std::endl;
             // Можно либо выйти, либо продолжить работу сервера без порта
         } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
             boost::system::error_code ec;
             sm->port.open(port_name, ec);
             if (!ec) {
                 sm->port.set_option(net::serial_port_base::baud_rate(9600));
+                sm->port.set_option(net::serial_port_base::flow_control(net::serial_port_base::flow_control::none));
                 start_serial_reading(sm);
-                std::cout << "[L1] Успешно подключено к: " << port_name << std::endl;
+                std::cout << "[L1] Successfully connected to: " << port_name << std::endl;
+            } else {
+                std::cerr << "[L1] ERROR opening the found port: " << ec.message() << std::endl;
             }
         }
 
         CncServer server(ioc, *sm);
-        std::cout << "[L2] WebSocket сервер запущен на порту 8080." << std::endl;
+        std::cout << "[L2] The WebSocket server is running on port 8080." << std::endl;
 
         ioc.run();
 
