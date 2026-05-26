@@ -9,6 +9,7 @@
 
 #ifndef _WIN32
     #include <sys/ioctl.h>
+    #include <filesystem>
 #endif
 
 
@@ -128,10 +129,14 @@ std::string find_available_port(net::io_context& ioc) {
     #ifdef _WIN32
         for (int i = 1; i <= 20; ++i) port_names.push_back("COM" + std::to_string(i));
     #else
-        for (int i = 0; i < 5; ++i) {
-            port_names.push_back("/dev/ttyACM" + std::to_string(i));
-            port_names.push_back("/dev/ttyUSB" + std::to_string(i));
-        }
+        try {
+            for (const auto& entry : std::filesystem::directory_iterator("/dev")) {
+                std::string s = entry.path().string();
+                if (s.find("ttyUSB") != std::string::npos || s.find("ttyACM") != std::string::npos) {
+                    port_names.push_back(s);
+                }
+            }
+        } catch (...) {}
     #endif
 
     std::cout << "[L1] Scanning..." << std::endl;
@@ -141,6 +146,8 @@ std::string find_available_port(net::io_context& ioc) {
             net::serial_port port(ioc);
             port.open(name);
             port.set_option(net::serial_port_base::baud_rate(9600));
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
 
             // 1. Отправляем запрос
             std::string request = "cs_helo\r\n";
