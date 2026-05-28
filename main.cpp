@@ -12,6 +12,8 @@
     #include <filesystem>
 #endif
 
+#define BAUDRATE 115200
+
 
 namespace net = boost::asio;
 namespace beast = boost::beast;
@@ -58,6 +60,8 @@ private:
 
             // 2. Добавляем терминатор (CR)
             if (!msg.empty() && msg.back() != '\r') msg += "\r";
+
+            std::cout << "[L3 -> L2] Dispatch: " << msg;
 
             // 3. СИНХРОННАЯ ЗАПИСЬ (Гарантирует уход в L1 без зависаний)
             if (self->sm_.port.is_open()) {
@@ -145,13 +149,13 @@ std::string find_available_port(net::io_context& ioc) {
         try {
             net::serial_port port(ioc);
             port.open(name);
-            port.set_option(net::serial_port_base::baud_rate(9600));
+            port.set_option(net::serial_port_base::baud_rate(BAUDRATE));
 
             std::this_thread::sleep_for(std::chrono::milliseconds(2000));
 
             // 1. Отправляем запрос
-            std::string request = "cs_helo\r\n";
-            net::write(port, net::buffer(request));
+            std::string request = "helo";
+            net::write(port, net::buffer(request += "\r"));
 
             // 2. Ждем ответа (на Linux/Arduino лучше 500ms, т.к. бывает авто-ресет)
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -237,9 +241,9 @@ int main() {
         auto sm = std::make_shared<SerialManager>(ioc);
 
         // --- АВТОМАТИЧЕСКИЙ ПОИСК ПОРТА ---
-        //std::string port_name = find_available_port(ioc);
+        std::string port_name = find_available_port(ioc);
         //--Заглушка--
-        std::string port_name = "COM4";
+        //std::string port_name = "COM5";
 
         if (port_name.empty()) {
             std::cerr << "!!! ERROR: No suitable serial port found." << std::endl;
@@ -249,7 +253,7 @@ int main() {
             boost::system::error_code ec;
             sm->port.open(port_name, ec);
             if (!ec) {
-                sm->port.set_option(net::serial_port_base::baud_rate(9600));
+                sm->port.set_option(net::serial_port_base::baud_rate(BAUDRATE));
                 sm->port.set_option(net::serial_port_base::flow_control(net::serial_port_base::flow_control::none));
                 start_serial_reading(sm);
                 std::cout << "[L1] Successfully connected to: " << port_name << std::endl;
