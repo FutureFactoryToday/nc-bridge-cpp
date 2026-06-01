@@ -12,6 +12,10 @@
     #include <filesystem>
 #endif
 
+#ifdef _WIN32
+    #include <windows.h>
+#endif
+
 #define BAUDRATE 115200
 
 
@@ -238,10 +242,20 @@ void start_terminal_input(net::io_context& ioc, std::shared_ptr<SerialManager> s
     }).detach(); // Отсоединяем поток, чтобы он жил своей жизнью
 }
 
+void setup_console() 
+{
+#ifdef _WIN32
+    // Включаем UTF-8 в консоли Windows
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+#endif
+}
+
 
 int main() {
     try {
-        SetConsoleOutputCP(65001);
+        setup_console();
+        
         net::io_context ioc;
         auto work_guard = net::make_work_guard(ioc);
         auto sm = std::make_shared<SerialManager>(ioc);
