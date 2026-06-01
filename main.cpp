@@ -59,7 +59,7 @@ private:
             self->ws_buffer_.consume(bytes);
 
             // 2. Добавляем терминатор (CR)
-            if (!msg.empty() && msg.back() != '\r') msg += "\r";
+            if (!msg.empty() && (msg.back() != '\r' || msg.back() != '\n')) msg += "\r\n";
 
             std::cout << "[L3 -> L2] Dispatch: " << msg;
 
@@ -154,6 +154,10 @@ std::string find_available_port(net::io_context& ioc) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2000));
 
             // 1. Отправляем запрос
+            std::string enter = "\n";
+            net::write(port, net::buffer(enter));
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
             std::string request = "helo";
             net::write(port, net::buffer(request += "\r"));
 
@@ -209,12 +213,13 @@ void start_terminal_input(net::io_context& ioc, std::shared_ptr<SerialManager> s
     std::thread([&ioc, sm]() {
         std::string line;
         std::cout << "[Debug] Terminal input ready. Type commands here:" << std::endl;
+        boost::asio::write(sm->port, net::buffer("\r\n"));
         
         while (std::getline(std::cin, line)) {
             if (line.empty()) continue;
 
             // Добавляем CR, как в логике с WebSocket
-            if (line.back() != '\r') line += "\r";
+            if (line.back() != '\r' || line.back() != '\n') line += "\r\n";
 
             // Передаем выполнение в поток io_context, чтобы не было конфликтов с портом
             net::post(ioc, [sm, line]() {
@@ -236,6 +241,7 @@ void start_terminal_input(net::io_context& ioc, std::shared_ptr<SerialManager> s
 
 int main() {
     try {
+        SetConsoleOutputCP(65001);
         net::io_context ioc;
         auto work_guard = net::make_work_guard(ioc);
         auto sm = std::make_shared<SerialManager>(ioc);
