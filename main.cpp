@@ -6,6 +6,7 @@
 #include <iostream>
 #include <string>
 #include <memory>
+#include <deque>
 
 #ifndef _WIN32
     #include <sys/ioctl.h>
@@ -29,6 +30,7 @@ class SerialManager {
 public:
     net::serial_port port;
     std::string line_accumulator;
+    std::mutex accum_mutex;
     char read_buf;
     SerialManager(net::io_context& ioc) : port(ioc) {}
 };
@@ -38,6 +40,7 @@ class CncSession : public std::enable_shared_from_this<CncSession> {
     websocket::stream<tcp::socket> ws_;
     SerialManager& sm_;
     beast::flat_buffer ws_buffer_;
+    std::deque<std::string> write_queue_; 
 
 public:
     CncSession(tcp::socket socket, SerialManager& sm) : ws_(std::move(socket)), sm_(sm) {}
@@ -46,9 +49,46 @@ public:
         ws_.async_accept([self = shared_from_this()](beast::error_code ec) {
             if (ec) return;
             std::cout << "[L2] Frontend connect" << std::endl;
+            self->send_status(self->sm_.port.is_open());
             self->do_read_ws();
         });
     }
+
+    void send_status(bool port_open) {
+        // Создаем строку
+        std::string status_msg = port_open ? "STATUS:READY" : "STATUS:NO_DEVICE";
+        
+        // Захватываем status_msg ПО ЗНАЧЕНИЮ [status_msg]
+        // Теперь лямбда хранит внутри себя собственную копию строки
+        safe_send(std::move(status_msg));
+    }
+
+    void safe_send(std::string msg) {
+        auto self = shared_from_this();
+        net::post(ws_.get_executor(), [self, msg = std::move(msg)]() {
+            bool write_in_progress = !self->write_queue_.empty();
+            self->write_queue_.push_back(std::move(msg));
+            
+            if (!write_in_progress) {
+                self->do_write();
+            }
+        });
+    }
+
+    void do_write() {
+        auto self = shared_from_this();
+        ws_.async_write(net::buffer(write_queue_.front()), 
+            [self](beast::error_code ec, std::size_t) {
+                if (ec) return;
+                self->write_queue_.pop_front();
+                if (!self->write_queue_.empty()) {
+                    self->do_write();
+                }
+            });
+    }
+
+
+
 
 private:
     void do_read_ws() {
@@ -59,11 +99,26 @@ private:
             }
 
             // 1. Получаем строку
-            std::string msg = beast::buffers_to_string(self->ws_buffer_.data());
+            auto data = self->ws_buffer_.data();
+            if (data.size() == 0) {
+                self->ws_buffer_.consume(bytes);
+                self->do_read_ws();
+                return;
+            }
+
+            std::string msg = beast::buffers_to_string(data);
             self->ws_buffer_.consume(bytes);
 
+            if (msg.empty()) {
+                self->do_read_ws();
+                return;
+            }
+
+            while(!msg.empty() && (msg.back() == ' ' || msg.back() == '\t')) msg.pop_back();
             // 2. Добавляем терминатор (CR)
-            if (!msg.empty() && (msg.back() != '\r' || msg.back() != '\n')) msg += "\r\n";
+            if (!msg.empty() && msg.back() != '\r' && msg.back() != '\n') {
+                msg += "\r\n";
+            }
 
             std::cout << "[L3 -> L2] Dispatch: " << msg;
 
@@ -72,9 +127,11 @@ private:
                 try {
                     std::cout << "[L3 -> L1] Dispatch: " << msg;
                     boost::asio::write(self->sm_.port, boost::asio::buffer(msg));
-                } catch (std::exception& e) {
-                    std::cerr << "Error writing to port: " << e.what() << std::endl;
+                } catch (...) {
+                    std::cerr << "Error writing to serial port: " << std::endl;
                 }
+            } else {
+                std::cout << "[L3] Frontend command ignored (no device): " << msg;
             }
 
             // Продолжаем слушать
@@ -106,28 +163,35 @@ private:
 
 
 // Постоянное чтение порта
-void start_serial_reading(std::shared_ptr<SerialManager> sm) {
-    sm->port.async_read_some(net::buffer(&(sm->read_buf), 1), [sm](beast::error_code ec, std::size_t n) {
-        if (!ec) {
+void start_serial_reading(std::shared_ptr<SerialManager> sm, std::function<void()> on_error) {
+    sm->port.async_read_some(net::buffer(&(sm->read_buf), 1), [sm, on_error](beast::error_code ec, std::size_t n) {
+        if (ec) {
+            std::cerr << "[L1] Device disconnected: " << ec.message() << std::endl;
+            if (sm->port.is_open()) {
+                sm->port.close();
+            }
+            
+            if (on_error) on_error(); 
+            return; // Выходим из цикла чтения
+        }
+        else {
             char c = sm->read_buf;
 
-            if (c == '\r' || c == '\n') {
-                if (!sm->line_accumulator.empty()) {
-                    // Строка готова для парсера
-                    std::cout << "[L1 -> Terminal] Dispatch: " << sm->line_accumulator << std::endl;
-                    
-                    // ВЫЗОВ ВАШЕГО ПАРСЕРА ЗДЕСЬ:
-                    // sm->parser.process(sm->line_accumulator);
-
-                    sm->line_accumulator.clear(); // Очистка для новой строки
+                std::lock_guard<std::mutex> lock(sm->accum_mutex); // Закрыли замок
+                if (c == '\r' || c == '\n') {
+                    if (!sm->line_accumulator.empty()) {
+                        std::string ready_line = std::move(sm->line_accumulator);
+                        sm->line_accumulator.clear(); 
+                        std::cout << "[L1] Dispatch: " << ready_line << std::endl;
+                        //Здесь может быть парсер
+                    }
+                } else {
+                    sm->line_accumulator += c;
                 }
-            } else {
-                sm->line_accumulator += c;
-            }
         }
         
         // Рекурсивный вызов для следующего символа
-        start_serial_reading(sm);
+        start_serial_reading(sm, on_error);
     });
 }
 
@@ -162,8 +226,8 @@ std::string find_available_port(net::io_context& ioc) {
             net::write(port, net::buffer(enter));
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-            std::string request = "helo";
-            net::write(port, net::buffer(request += "\r"));
+            std::string request = "helo\r";
+            net::write(port, net::buffer(request));
 
             // 2. Ждем ответа (на Linux/Arduino лучше 500ms, т.к. бывает авто-ресет)
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -189,8 +253,11 @@ std::string find_available_port(net::io_context& ioc) {
                 std::vector<char> buffer(bytes_to_read);
                 size_t n = port.read_some(net::buffer(buffer), ec);
                 if (!ec && n > 0) {
-                    std::string response(buffer.data(), n);
+                    std::string response;
+                    response.assign(buffer.data(), n);
+
                     std::cout << "[L1] Checking " << name << ": Received: " << response << std::endl;
+
                     if (response.find("helo_ok") != std::string::npos) {
                         port.close();
                         return name;
@@ -201,7 +268,7 @@ std::string find_available_port(net::io_context& ioc) {
             }
 
 
-            port.close();
+            port.close(ec);
         } catch (...) {
             continue; // Порт занят или не существует
         }
@@ -216,30 +283,27 @@ void start_terminal_input(net::io_context& ioc, std::shared_ptr<SerialManager> s
     // Запускаем поток для чтения cin
     std::thread([&ioc, sm]() {
         std::string line;
-        std::cout << "[Debug] Terminal input ready. Type commands here:" << std::endl;
-        boost::asio::write(sm->port, net::buffer("\r\n"));
-        
         while (std::getline(std::cin, line)) {
             if (line.empty()) continue;
 
-            // Добавляем CR, как в логике с WebSocket
-            if (line.back() != '\r' || line.back() != '\n') line += "\r\n";
-
-            // Передаем выполнение в поток io_context, чтобы не было конфликтов с портом
+            // Передаем задачу в io_context
             net::post(ioc, [sm, line]() {
-                if (sm->port.is_open()) {
+                // Проверяем порт именно В МОМЕНТ выполнения задачи, а не отправки
+                if (sm && sm->port.is_open()) {
                     try {
-                        std::cout << "[Terminal -> L1] Dispatch: " << line << "\n";
-                        boost::asio::write(sm->port, net::buffer(line));
-                    } catch (std::exception& e) {
-                        std::cerr << "Terminal write error: " << e.what() << std::endl;
+                        std::string msg = line + "\r\n";
+                        net::write(sm->port, net::buffer(msg));
+                        std::cout << "[Terminal -> L1] Sent: " << line << std::endl;
+                    } catch (...) {
+                        std::cerr << "[Terminal] Write error!" << std::endl;
                     }
                 } else {
-                    std::cerr << "[L1] Error: Port is closed. Cannot send: " << line << std::endl;
+                    std::cout << "[Terminal] Command ignored: Device not ready." << std::endl;
                 }
             });
         }
-    }).detach(); // Отсоединяем поток, чтобы он жил своей жизнью
+    }).detach();
+
 }
 
 void setup_console() 
@@ -248,6 +312,7 @@ void setup_console()
     // Включаем UTF-8 в консоли Windows
     SetConsoleOutputCP(65001);
     SetConsoleCP(65001);
+    std::setlocale(LC_ALL, "Russian");
 #endif
 }
 
@@ -257,33 +322,49 @@ int main() {
         setup_console();
         
         net::io_context ioc;
-        auto work_guard = net::make_work_guard(ioc);
+        //auto work_guard = net::make_work_guard(ioc);
         auto sm = std::make_shared<SerialManager>(ioc);
 
         // --- АВТОМАТИЧЕСКИЙ ПОИСК ПОРТА ---
-        std::string port_name = find_available_port(ioc);
+        //std::string port_name = find_available_port(ioc);
         //--Заглушка--
         //std::string port_name = "COM5";
 
-        if (port_name.empty()) {
-            std::cerr << "!!! ERROR: No suitable serial port found." << std::endl;
-            // Можно либо выйти, либо продолжить работу сервера без порта
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            boost::system::error_code ec;
-            sm->port.open(port_name, ec);
-            if (!ec) {
-                sm->port.set_option(net::serial_port_base::baud_rate(BAUDRATE));
-                sm->port.set_option(net::serial_port_base::flow_control(net::serial_port_base::flow_control::none));
-                start_serial_reading(sm);
-                std::cout << "[L1] Successfully connected to: " << port_name << std::endl;
-            } else {
-                std::cerr << "[L1] ERROR opening the found port: " << ec.message() << std::endl;
+
+
+
+        // 2. Функция для периодического поиска
+        std::function<void()> do_find_device;
+        do_find_device = [&ioc, sm, &do_find_device]() {
+            if (sm->port.is_open()) return;
+
+            std::string port_name = find_available_port(ioc);
+            
+            if (!port_name.empty()) {
+                try {
+                    sm->port.open(port_name);
+                    sm->port.set_option(net::serial_port_base::baud_rate(BAUDRATE));
+                    net::write(sm->port, net::buffer("\r\n"));
+                    start_serial_reading(sm, do_find_device); 
+                    std::cout << "[L1] Successfully connected to: " << port_name << std::endl;
+                    return; // Выходим из цикла поиска
+                } catch (...) {
+                    std::cerr << "[L1] ERROR opening the found port: " << port_name << std::endl;
+                }
             }
-        }
+
+            // Если не нашли или не открыли — пробуем снова через 3 секунды
+            std::cout << "[L1] Searching for device..." << std::endl;
+            auto timer = std::make_shared<net::steady_timer>(ioc, std::chrono::seconds(3));
+            timer->async_wait([&do_find_device, timer](const boost::system::error_code& ec) {
+                if (!ec) do_find_device();
+            });
+        };
+
+        // Запускаем поиск
+        do_find_device();
 
         start_terminal_input(ioc, sm);
-
         CncServer server(ioc, *sm);
         std::cout << "[L2] The WebSocket server is running on port 8080." << std::endl;
 
