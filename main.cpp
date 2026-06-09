@@ -34,22 +34,30 @@ using tcp = net::ip::tcp;
 // ----------------------------------------------------------------------
 class SerialManager : public std::enable_shared_from_this<SerialManager> {
 public:
-    net::serial_port port;
-    std::string line_accumulator;
-    std::mutex accum_mutex;
-    char read_buf;
-    bool was_open = false;
-    std::atomic<bool> is_searching{false};
-    std::atomic<bool> stop_flag{false};   // флаг остановки всех операций
-
-    // Наблюдатели
-    std::mutex status_observers_mutex;
-    std::vector<std::function<void(bool)>> status_observers;
-    std::mutex line_observers_mutex;
-    std::vector<std::function<void(const std::string&)>> line_observers;
-
     SerialManager(net::io_context& ioc) : port(ioc) {}
 
+    // Публичные методы доступа к внутренним данным
+    net::serial_port& get_port() { return port; }
+
+    std::mutex& get_accum_mutex() { return accum_mutex; }
+    std::string& get_line_accumulator() { return line_accumulator; }
+    char& get_read_buf() { return read_buf; }
+
+    bool get_was_open() const { return was_open; }
+    void set_was_open(bool val) { was_open = val; }
+
+    bool acquire_search_lock() {
+        bool expected = false;
+        return is_searching.compare_exchange_strong(expected, true);
+    }
+    void release_search_lock() {
+        is_searching = false;
+    }
+
+    bool is_stop_requested() const { return stop_flag; }
+    void set_stop_requested() { stop_flag = true; }
+
+    // Методы для подписки на события
     void add_status_observer(std::function<void(bool)> observer) {
         std::lock_guard<std::mutex> lock(status_observers_mutex);
         status_observers.push_back(std::move(observer));
@@ -60,6 +68,7 @@ public:
         line_observers.push_back(std::move(observer));
     }
 
+    // Уведомления
     void notify_status_change(bool is_open) {
         std::lock_guard<std::mutex> lock(status_observers_mutex);
         for (auto& obs : status_observers) obs(is_open);
@@ -70,6 +79,7 @@ public:
         for (auto& obs : line_observers) obs(line);
     }
 
+    // Проверка и уведомление о смене статуса порта
     void check_and_notify_status() {
         bool current_state = port.is_open();
         if (current_state != was_open) {
@@ -80,12 +90,27 @@ public:
 
     // Остановка всех операций порта
     void stop() {
-        stop_flag = true;
+        set_stop_requested();
         boost::system::error_code ec;
         port.cancel(ec);   // отменяем все асинхронные операции
         port.close(ec);    // закрываем порт
         notify_status_change(false);
     }
+
+private:
+    net::serial_port port;
+    std::string line_accumulator;
+    std::mutex accum_mutex;
+    char read_buf = 0;
+    bool was_open = false;
+    std::atomic<bool> is_searching{false};
+    std::atomic<bool> stop_flag{false};   // флаг остановки всех операций
+
+    // Наблюдатели
+    std::mutex status_observers_mutex;
+    std::vector<std::function<void(bool)>> status_observers;
+    std::mutex line_observers_mutex;
+    std::vector<std::function<void(const std::string&)>> line_observers;
 };
 
 // ----------------------------------------------------------------------
@@ -117,7 +142,7 @@ public:
                 return;
             }
             std::cout << "[L2] Frontend connected" << std::endl;
-            self->send_status(self->sm_.port.is_open());
+            self->send_status(self->sm_.get_port().is_open());
             self->start_periodic_status();
             self->do_read_ws();
         });
@@ -181,8 +206,8 @@ private:
         status_timer_->async_wait([self](boost::system::error_code ec) {
             if (ec == boost::asio::error::operation_aborted)
                 return;
-            if (!ec && self->ws_.is_open() && self->status_timer_active_ && !self->sm_.stop_flag) {
-                self->send_status(self->sm_.port.is_open());
+            if (!ec && self->ws_.is_open() && self->status_timer_active_ && !self->sm_.is_stop_requested()) {
+                self->send_status(self->sm_.get_port().is_open());
                 self->schedule_status_timer();
             } else {
                 self->status_timer_active_ = false;
@@ -222,11 +247,11 @@ private:
 
             std::cout << "[L3 -> L2] Dispatch: " << msg;
 
-            if (self->sm_.port.is_open() && !self->sm_.stop_flag) {
+            if (self->sm_.get_port().is_open() && !self->sm_.is_stop_requested()) {
                 try {
                     std::cout << "[L3 -> L1] Dispatch: " << msg;
                     auto write_buffer = std::make_shared<std::string>(msg);
-                    net::async_write(self->sm_.port, net::buffer(*write_buffer),
+                    net::async_write(self->sm_.get_port(), net::buffer(*write_buffer),
                         [write_buffer](boost::system::error_code ec, std::size_t) {
                             if (ec)
                                 std::cerr << "Error writing to serial port: " << ec.message() << std::endl;
@@ -321,46 +346,46 @@ private:
 //  Постоянное асинхронное чтение из последовательного порта (с учётом флага остановки)
 // ----------------------------------------------------------------------
 void start_serial_reading(std::shared_ptr<SerialManager> sm, std::function<void()> on_disconnect) {
-    if (!sm->port.is_open()) return;
+    if (!sm->get_port().is_open()) return;
 
     auto read_loop = std::make_shared<std::function<void()>>();
     *read_loop = [sm, on_disconnect, read_loop]() {
-        if (!sm->port.is_open() || sm->stop_flag) return;
+        if (!sm->get_port().is_open() || sm->is_stop_requested()) return;
 
-        sm->port.async_read_some(net::buffer(&(sm->read_buf), 1),
+        sm->get_port().async_read_some(net::buffer(&(sm->get_read_buf()), 1),
             [sm, on_disconnect, read_loop](beast::error_code ec, std::size_t n) {
-                if (sm->stop_flag) return;
+                if (sm->is_stop_requested()) return;
                 if (ec) {
                     std::cerr << "[L1] Device disconnected: " << ec.message() << std::endl;
-                    if (sm->port.is_open()) {
+                    if (sm->get_port().is_open()) {
                         boost::system::error_code close_ec;
-                        sm->port.close(close_ec);
-                        sm->was_open = false;
+                        sm->get_port().close(close_ec);
+                        sm->set_was_open(false);
                         sm->notify_status_change(false);
                     }
-                    if (on_disconnect && !sm->stop_flag) {
-                        auto executor = sm->port.get_executor();
+                    if (on_disconnect && !sm->is_stop_requested()) {
+                        auto executor = sm->get_port().get_executor();
                         net::post(executor, [on_disconnect]() { on_disconnect(); });
                     }
                     return;
                 }
 
-                char c = sm->read_buf;
+                char c = sm->get_read_buf();
                 {
-                    std::lock_guard<std::mutex> lock(sm->accum_mutex);
+                    std::lock_guard<std::mutex> lock(sm->get_accum_mutex());
                     if (c == '\r' || c == '\n') {
-                        if (!sm->line_accumulator.empty()) {
-                            std::string ready_line = std::move(sm->line_accumulator);
-                            sm->line_accumulator.clear();
+                        if (!sm->get_line_accumulator().empty()) {
+                            std::string ready_line = std::move(sm->get_line_accumulator());
+                            sm->get_line_accumulator().clear();
                             std::cout << "[L1] Dispatch: " << ready_line << std::endl;
                             sm->notify_line_received(ready_line);
                         }
                     } else {
-                        sm->line_accumulator += c;
+                        sm->get_line_accumulator() += c;
                     }
                 }
 
-                if (!sm->stop_flag)
+                if (!sm->is_stop_requested())
                     (*read_loop)();
             });
     };
@@ -448,14 +473,14 @@ void start_terminal_input(net::io_context& ioc, std::shared_ptr<SerialManager> s
     std::thread([&ioc, sm]() {
         std::string line;
         while (std::getline(std::cin, line)) {
-            if (sm->stop_flag) break;
+            if (sm->is_stop_requested()) break;
             if (line.empty()) continue;
             net::post(ioc, [sm, line]() {
-                if (sm->stop_flag) return;
-                if (sm && sm->port.is_open()) {
+                if (sm->is_stop_requested()) return;
+                if (sm && sm->get_port().is_open()) {
                     try {
                         std::string msg = line + "\r\n";
-                        net::write(sm->port, net::buffer(msg));
+                        net::write(sm->get_port(), net::buffer(msg));
                         std::cout << "[Terminal -> L1] Sent: " << line << std::endl;
                     } catch (...) {
                         std::cerr << "[Terminal] Write error!" << std::endl;
@@ -471,24 +496,22 @@ void start_terminal_input(net::io_context& ioc, std::shared_ptr<SerialManager> s
 // ----------------------------------------------------------------------
 //  Циклический поиск устройства (с учётом флага остановки)
 // ----------------------------------------------------------------------
-void do_find_device(std::shared_ptr<SerialManager> sm, net::io_context& ioc,
-                    std::shared_ptr<net::steady_timer> timer = nullptr) {
-    if (sm->stop_flag) return;
-    if (sm->port.is_open()) return;
+void do_find_device(std::shared_ptr<SerialManager> sm, net::io_context& ioc, std::shared_ptr<net::steady_timer> timer = nullptr) {
+    if (sm->is_stop_requested()) return;
+    if (sm->get_port().is_open()) return;
 
-    bool expected = false;
-    if (!sm->is_searching.compare_exchange_strong(expected, true)) return;
+    if (!sm->acquire_search_lock()) return;
 
     std::string port_name = find_available_port(ioc);
 
     if (!port_name.empty()) {
         try {
-            sm->port.open(port_name);
-            sm->port.set_option(net::serial_port_base::baud_rate(BAUDRATE));
-            sm->was_open = true;
+            sm->get_port().open(port_name);
+            sm->get_port().set_option(net::serial_port_base::baud_rate(BAUDRATE));
+            sm->set_was_open(true);
 
             try {
-                net::write(sm->port, net::buffer("\r\n"));
+                net::write(sm->get_port(), net::buffer("\r\n"));
             } catch (const std::exception& e) {
                 std::cerr << "[L1] Initial write failed: " << e.what() << std::endl;
                 throw;
@@ -496,35 +519,35 @@ void do_find_device(std::shared_ptr<SerialManager> sm, net::io_context& ioc,
 
             auto sm_ptr = sm;
             start_serial_reading(sm, [&ioc, sm_ptr]() {
-                if (sm_ptr->stop_flag) return;
+                if (sm_ptr->is_stop_requested()) return;
                 auto new_timer = std::make_shared<net::steady_timer>(ioc, std::chrono::seconds(1));
                 do_find_device(sm_ptr, ioc, new_timer);
             });
 
             sm->notify_status_change(true);
             std::cout << "[L1] Successfully connected to: " << port_name << std::endl;
-            sm->is_searching = false;
+            sm->release_search_lock();
             return;
         } catch (const std::exception& e) {
             std::cerr << "[L1] ERROR opening the found port: " << port_name
                       << " - " << e.what() << std::endl;
-            if (sm->port.is_open()) {
+            if (sm->get_port().is_open()) {
                 boost::system::error_code close_ec;
-                sm->port.close(close_ec);
+                sm->get_port().close(close_ec);
             }
         }
     }
 
-    sm->is_searching = false;
+    sm->release_search_lock();
 
-    if (sm->stop_flag) return;
+    if (sm->is_stop_requested()) return;
 
     if (!timer) timer = std::make_shared<net::steady_timer>(ioc);
     std::cout << "[L1] Searching for device..." << std::endl;
     timer->expires_after(std::chrono::seconds(3));
     timer->async_wait([&ioc, sm, timer](const boost::system::error_code& ec) {
-        if (ec || sm->stop_flag) return;
-        if (!sm->port.is_open())
+        if (ec || sm->is_stop_requested()) return;
+        if (!sm->get_port().is_open())
             do_find_device(sm, ioc, timer);
     });
 }
