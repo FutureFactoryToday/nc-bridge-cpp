@@ -40,12 +40,11 @@ public:
     char read_buf;
     bool was_open = false;
     std::atomic<bool> is_searching{false};
+    std::atomic<bool> stop_flag{false};   // флаг остановки всех операций
 
-    // Наблюдатели за изменением статуса порта
+    // Наблюдатели
     std::mutex status_observers_mutex;
     std::vector<std::function<void(bool)>> status_observers;
-
-    // Наблюдатели за получением новой строки из порта
     std::mutex line_observers_mutex;
     std::vector<std::function<void(const std::string&)>> line_observers;
 
@@ -77,6 +76,15 @@ public:
             was_open = current_state;
             notify_status_change(current_state);
         }
+    }
+
+    // Остановка всех операций порта
+    void stop() {
+        stop_flag = true;
+        boost::system::error_code ec;
+        port.cancel(ec);   // отменяем все асинхронные операции
+        port.close(ec);    // закрываем порт
+        notify_status_change(false);
     }
 };
 
@@ -115,9 +123,15 @@ public:
         });
     }
 
-    // Отправка сообщения клиенту (можно вызывать из внешнего кода)
     void deliver(const std::string& message) {
         safe_send(message);
+    }
+
+    // Принудительное закрытие сессии (для остановки)
+    void stop() {
+        boost::system::error_code ec;
+        ws_.close(websocket::close_code::normal, ec);
+        stop_periodic_status();
     }
 
 private:
@@ -167,7 +181,7 @@ private:
         status_timer_->async_wait([self](boost::system::error_code ec) {
             if (ec == boost::asio::error::operation_aborted)
                 return;
-            if (!ec && self->ws_.is_open() && self->status_timer_active_) {
+            if (!ec && self->ws_.is_open() && self->status_timer_active_ && !self->sm_.stop_flag) {
                 self->send_status(self->sm_.port.is_open());
                 self->schedule_status_timer();
             } else {
@@ -201,7 +215,6 @@ private:
                 self->do_read_ws();
                 return;
             }
-            // нормализация команды
             while (!msg.empty() && (msg.back() == ' ' || msg.back() == '\t'))
                 msg.pop_back();
             if (!msg.empty() && msg.back() != '\r' && msg.back() != '\n')
@@ -209,7 +222,7 @@ private:
 
             std::cout << "[L3 -> L2] Dispatch: " << msg;
 
-            if (self->sm_.port.is_open()) {
+            if (self->sm_.port.is_open() && !self->sm_.stop_flag) {
                 try {
                     std::cout << "[L3 -> L1] Dispatch: " << msg;
                     auto write_buffer = std::make_shared<std::string>(msg);
@@ -222,7 +235,7 @@ private:
                     std::cerr << "Exception writing to serial port: " << e.what() << std::endl;
                 }
             } else {
-                std::cout << "[L3] Frontend command ignored (no device): " << msg;
+                std::cout << "[L3] Frontend command ignored (no device or stopping): " << msg;
             }
             self->do_read_ws();
         });
@@ -243,6 +256,7 @@ class CncServer : public std::enable_shared_from_this<CncServer> {
     SerialManager& sm_;
     std::vector<std::weak_ptr<CncSession>> sessions_;
     std::mutex sessions_mutex_;
+    std::atomic<bool> stop_flag_{false};
 
 public:
     CncServer(net::io_context& ioc, SerialManager& sm)
@@ -251,18 +265,16 @@ public:
         do_accept();
     }
 
-    // Инициализация: подписка на строки порта. Вызывать после создания shared_ptr.
     void init() {
         auto self = shared_from_this();
         sm_.add_line_observer([self](const std::string& line) {
-            if (self)
+            if (self && !self->stop_flag_)
                 self->broadcast(line);
         });
     }
 
     void broadcast(const std::string& message) {
         std::lock_guard<std::mutex> lock(sessions_mutex_);
-        // удаляем мёртвые сессии
         sessions_.erase(std::remove_if(sessions_.begin(), sessions_.end(),
             [](const std::weak_ptr<CncSession>& wp) { return wp.expired(); }),
             sessions_.end());
@@ -273,9 +285,23 @@ public:
         }
     }
 
+    // Остановка сервера: закрываем acceptor и все сессии
+    void stop() {
+        stop_flag_ = true;
+        boost::system::error_code ec;
+        acceptor_.close(ec);
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        for (auto& wp : sessions_) {
+            if (auto session = wp.lock())
+                session->stop();
+        }
+        sessions_.clear();
+    }
+
 private:
     void do_accept() {
         acceptor_.async_accept([this](beast::error_code ec, tcp::socket socket) {
+            if (stop_flag_) return;
             if (!ec) {
                 auto session = std::make_shared<CncSession>(std::move(socket), sm_);
                 session->init();
@@ -285,23 +311,25 @@ private:
                     sessions_.push_back(session);
                 }
             }
-            do_accept();
+            if (!stop_flag_)
+                do_accept();
         });
     }
 };
 
 // ----------------------------------------------------------------------
-//  Постоянное асинхронное чтение из последовательного порта
+//  Постоянное асинхронное чтение из последовательного порта (с учётом флага остановки)
 // ----------------------------------------------------------------------
 void start_serial_reading(std::shared_ptr<SerialManager> sm, std::function<void()> on_disconnect) {
     if (!sm->port.is_open()) return;
 
     auto read_loop = std::make_shared<std::function<void()>>();
     *read_loop = [sm, on_disconnect, read_loop]() {
-        if (!sm->port.is_open()) return;
+        if (!sm->port.is_open() || sm->stop_flag) return;
 
         sm->port.async_read_some(net::buffer(&(sm->read_buf), 1),
             [sm, on_disconnect, read_loop](beast::error_code ec, std::size_t n) {
+                if (sm->stop_flag) return;
                 if (ec) {
                     std::cerr << "[L1] Device disconnected: " << ec.message() << std::endl;
                     if (sm->port.is_open()) {
@@ -310,7 +338,7 @@ void start_serial_reading(std::shared_ptr<SerialManager> sm, std::function<void(
                         sm->was_open = false;
                         sm->notify_status_change(false);
                     }
-                    if (on_disconnect) {
+                    if (on_disconnect && !sm->stop_flag) {
                         auto executor = sm->port.get_executor();
                         net::post(executor, [on_disconnect]() { on_disconnect(); });
                     }
@@ -332,14 +360,15 @@ void start_serial_reading(std::shared_ptr<SerialManager> sm, std::function<void(
                     }
                 }
 
-                (*read_loop)();
+                if (!sm->stop_flag)
+                    (*read_loop)();
             });
     };
     (*read_loop)();
 }
 
 // ----------------------------------------------------------------------
-//  Поиск устройства по протоколу "helo_ok"
+//  Поиск устройства по протоколу "helo_ok" (с учётом флага остановки)
 // ----------------------------------------------------------------------
 std::string find_available_port(net::io_context& ioc) {
     std::vector<std::string> port_names;
@@ -413,14 +442,16 @@ std::string find_available_port(net::io_context& ioc) {
 }
 
 // ----------------------------------------------------------------------
-//  Фоновое чтение из stdin (терминал)
+//  Фоновое чтение из stdin (терминал) – тоже учитываем флаг остановки
 // ----------------------------------------------------------------------
 void start_terminal_input(net::io_context& ioc, std::shared_ptr<SerialManager> sm) {
     std::thread([&ioc, sm]() {
         std::string line;
         while (std::getline(std::cin, line)) {
+            if (sm->stop_flag) break;
             if (line.empty()) continue;
             net::post(ioc, [sm, line]() {
+                if (sm->stop_flag) return;
                 if (sm && sm->port.is_open()) {
                     try {
                         std::string msg = line + "\r\n";
@@ -438,10 +469,11 @@ void start_terminal_input(net::io_context& ioc, std::shared_ptr<SerialManager> s
 }
 
 // ----------------------------------------------------------------------
-//  Циклический поиск устройства (при отключении или при запуске)
+//  Циклический поиск устройства (с учётом флага остановки)
 // ----------------------------------------------------------------------
 void do_find_device(std::shared_ptr<SerialManager> sm, net::io_context& ioc,
                     std::shared_ptr<net::steady_timer> timer = nullptr) {
+    if (sm->stop_flag) return;
     if (sm->port.is_open()) return;
 
     bool expected = false;
@@ -464,6 +496,7 @@ void do_find_device(std::shared_ptr<SerialManager> sm, net::io_context& ioc,
 
             auto sm_ptr = sm;
             start_serial_reading(sm, [&ioc, sm_ptr]() {
+                if (sm_ptr->stop_flag) return;
                 auto new_timer = std::make_shared<net::steady_timer>(ioc, std::chrono::seconds(1));
                 do_find_device(sm_ptr, ioc, new_timer);
             });
@@ -484,11 +517,14 @@ void do_find_device(std::shared_ptr<SerialManager> sm, net::io_context& ioc,
 
     sm->is_searching = false;
 
+    if (sm->stop_flag) return;
+
     if (!timer) timer = std::make_shared<net::steady_timer>(ioc);
     std::cout << "[L1] Searching for device..." << std::endl;
     timer->expires_after(std::chrono::seconds(3));
     timer->async_wait([&ioc, sm, timer](const boost::system::error_code& ec) {
-        if (!ec && !sm->port.is_open())
+        if (ec || sm->stop_flag) return;
+        if (!sm->port.is_open())
             do_find_device(sm, ioc, timer);
     });
 }
@@ -514,22 +550,25 @@ int main() {
         net::io_context ioc;
         auto work_guard = net::make_work_guard(ioc);
         auto sm = std::make_shared<SerialManager>(ioc);
-
-        boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
-        signals.async_wait([&ioc, &work_guard](const boost::system::error_code&, int) {
-            std::cout << "\n[MAIN] Shutting down..." << std::endl;
-            work_guard.reset();
-        });
+        auto server = std::make_shared<CncServer>(ioc, *sm);
+        server->init();   // подписка на строки порта
 
         do_find_device(sm, ioc);
         start_terminal_input(ioc, sm);
-        auto server = std::make_shared<CncServer>(ioc, *sm);
-        server->init();   // !!! ВАЖНО: инициализация после создания shared_ptr
+
+        boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
+        signals.async_wait([&ioc, &work_guard, sm, server](const boost::system::error_code&, int) {
+            std::cout << "\n[MAIN] Shutting down..." << std::endl;
+            server->stop();     // останавливаем WebSocket сервер
+            sm->stop();         // останавливаем работу с портом
+            work_guard.reset(); // разрешаем выход из ioc.run()
+        });
 
         std::cout << "[L2] WebSocket server running on port 8080" << std::endl;
         std::cout << "[MAIN] Press Ctrl+C to exit" << std::endl;
 
         ioc.run();
+        std::cout << "[MAIN] Goodbye." << std::endl;
     } catch (std::exception const& e) {
         std::cerr << "FATAL ERROR: " << e.what() << std::endl;
         return 1;
