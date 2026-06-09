@@ -33,57 +33,92 @@ using tcp = net::ip::tcp;
 //  SerialManager – управление последовательным портом, уведомления о статусе и новых строках
 // ----------------------------------------------------------------------
 class SerialManager : public std::enable_shared_from_this<SerialManager> {
+
 public:
+    SerialManager(net::io_context& ioc) 
+        : port(ioc) {}
+    // Публичные методы доступа к внутренним данным
+    net::serial_port& get_port();
+    std::mutex& get_accum_mutex();
+    std::string& get_line_accumulator();
+    char& get_read_buf();
+    bool get_was_open() const;
+    void set_was_open(bool val);
+    bool acquire_search_lock();
+    void release_search_lock();
+    bool is_stop_requested() const;
+    void set_stop_requested();
+    // Методы для подписки на события
+    void add_status_observer(std::function<void(bool)> observer);
+    void add_line_observer(std::function<void(const std::string&)> observer);
+    // Уведомления
+    void notify_status_change(bool is_open);
+    void notify_line_received(const std::string& line);
+    // Проверка и уведомление о смене статуса порта
+    void check_and_notify_status();
+    // Остановка всех операций порта
+    void stop();
+private:
     net::serial_port port;
     std::string line_accumulator;
     std::mutex accum_mutex;
-    char read_buf;
+    char read_buf = 0;
     bool was_open = false;
     std::atomic<bool> is_searching{false};
     std::atomic<bool> stop_flag{false};   // флаг остановки всех операций
-
     // Наблюдатели
     std::mutex status_observers_mutex;
     std::vector<std::function<void(bool)>> status_observers;
     std::mutex line_observers_mutex;
     std::vector<std::function<void(const std::string&)>> line_observers;
+};
 
-    SerialManager(net::io_context& ioc) : port(ioc) {}
+// ----------------------------------------------------------------------
+//  CncSession – WebSocket-сессия для одного фронтенда
+// ----------------------------------------------------------------------
+class CncSession : public std::enable_shared_from_this<CncSession> {
 
-    void add_status_observer(std::function<void(bool)> observer) {
-        std::lock_guard<std::mutex> lock(status_observers_mutex);
-        status_observers.push_back(std::move(observer));
-    }
+public:
+    CncSession(tcp::socket socket, SerialManager& sm)
+        : ws_(std::move(socket)), sm_(sm) {}
+    ~CncSession();
+    void init();
+    void start();
+    void deliver(const std::string& message);
+    // Принудительное закрытие сессии (для остановки)
+    void stop();
+private:
+    websocket::stream<tcp::socket> ws_;
+    SerialManager& sm_;
+    beast::flat_buffer ws_buffer_;
+    std::deque<std::string> write_queue_;
+    std::shared_ptr<net::steady_timer> status_timer_;
+    std::atomic<bool> status_timer_active_{false};
 
-    void add_line_observer(std::function<void(const std::string&)> observer) {
-        std::lock_guard<std::mutex> lock(line_observers_mutex);
-        line_observers.push_back(std::move(observer));
-    }
+    void send_status(bool port_open);
+    void safe_send(std::string msg);
+    void do_write();
+    void start_periodic_status();
+    void schedule_status_timer();
+    void stop_periodic_status();
+    void do_read_ws();
+};
 
-    void notify_status_change(bool is_open) {
-        std::lock_guard<std::mutex> lock(status_observers_mutex);
-        for (auto& obs : status_observers) obs(is_open);
-    }
+class CncServer : public std::enable_shared_from_this<CncServer> {
 
-    void notify_line_received(const std::string& line) {
-        std::lock_guard<std::mutex> lock(line_observers_mutex);
-        for (auto& obs : line_observers) obs(line);
-    }
+public:
+    CncServer(net::io_context& ioc, SerialManager& sm);
+    void init();
+    void broadcast(const std::string& message);
+    // Остановка сервера: закрываем acceptor и все сессии
+    void stop();
 
-    void check_and_notify_status() {
-        bool current_state = port.is_open();
-        if (current_state != was_open) {
-            was_open = current_state;
-            notify_status_change(current_state);
-        }
-    }
+private:
+    tcp::acceptor acceptor_;
+    SerialManager& sm_;
+    std::vector<std::weak_ptr<CncSession>> sessions_;
+    std::mutex sessions_mutex_;
+    std::atomic<bool> stop_flag_{false};
 
-    // Остановка всех операций порта
-    void stop() {
-        stop_flag = true;
-        boost::system::error_code ec;
-        port.cancel(ec);   // отменяем все асинхронные операции
-        port.close(ec);    // закрываем порт
-        notify_status_change(false);
-    }
+    void do_accept();
 };

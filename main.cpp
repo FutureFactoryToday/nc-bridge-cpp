@@ -1,346 +1,293 @@
-#include <boost/beast/core.hpp>
-#include <boost/beast/websocket.hpp>
-#include <boost/asio.hpp>
-#include <functional>
-#include <vector>
-#include <chrono>
-#include <thread>
-#include <iostream>
-#include <string>
-#include <memory>
-#include <deque>
-#include <atomic>
-#include <mutex>
-#include <boost/asio/signal_set.hpp>
-
-#ifndef _WIN32
-    #include <sys/ioctl.h>
-    #include <filesystem>
-#endif
-
-#ifdef _WIN32
-    #include <windows.h>
-#endif
-
-#define BAUDRATE 115200
-
-namespace net = boost::asio;
-namespace beast = boost::beast;
-namespace websocket = beast::websocket;
-using tcp = net::ip::tcp;
-
+#include "main.h"
 // ----------------------------------------------------------------------
 //  SerialManager – управление последовательным портом, уведомления о статусе и новых строках
 // ----------------------------------------------------------------------
-class SerialManager : public std::enable_shared_from_this<SerialManager> {
-public:
-    SerialManager(net::io_context& ioc) : port(ioc) {}
+// Публичные методы доступа к внутренним данным
+net::serial_port& SerialManager::get_port() {
+    return port;
+}
 
-    // Публичные методы доступа к внутренним данным
-    net::serial_port& get_port() { return port; }
+std::mutex& SerialManager::get_accum_mutex() {
+    return accum_mutex;
+}
 
-    std::mutex& get_accum_mutex() { return accum_mutex; }
-    std::string& get_line_accumulator() { return line_accumulator; }
-    char& get_read_buf() { return read_buf; }
+std::string& SerialManager::get_line_accumulator() {
+    return line_accumulator;
+}
 
-    bool get_was_open() const { return was_open; }
-    void set_was_open(bool val) { was_open = val; }
+char& SerialManager::get_read_buf() {
+    return read_buf;
+}
 
-    bool acquire_search_lock() {
-        bool expected = false;
-        return is_searching.compare_exchange_strong(expected, true);
+bool SerialManager::get_was_open() const {
+    return was_open;
+}
+
+void SerialManager::set_was_open(bool val) {
+    was_open = val;
+}
+
+bool SerialManager::acquire_search_lock() {
+    bool expected = false;
+    return is_searching.compare_exchange_strong(expected, true);
+}
+
+void SerialManager::release_search_lock() {
+    is_searching = false;
+}
+
+bool SerialManager::is_stop_requested() const {
+    return stop_flag; 
+}
+
+void SerialManager::set_stop_requested() {
+    stop_flag = true;
+}
+
+// Методы для подписки на события
+void SerialManager::add_status_observer(std::function<void(bool)> observer) {
+    std::lock_guard<std::mutex> lock(status_observers_mutex);
+    status_observers.push_back(std::move(observer));
+}
+
+void SerialManager::add_line_observer(std::function<void(const std::string&)> observer) {
+    std::lock_guard<std::mutex> lock(line_observers_mutex);
+    line_observers.push_back(std::move(observer));
+}
+
+// Уведомления
+void SerialManager::notify_status_change(bool is_open) {
+    std::lock_guard<std::mutex> lock(status_observers_mutex);
+    for (auto& obs : status_observers) obs(is_open);
+}
+
+void SerialManager::notify_line_received(const std::string& line) {
+    std::lock_guard<std::mutex> lock(line_observers_mutex);
+    for (auto& obs : line_observers) obs(line);
+}
+
+// Проверка и уведомление о смене статуса порта
+void SerialManager::check_and_notify_status() {
+    bool current_state = port.is_open();
+    if (current_state != was_open) {
+        was_open = current_state;
+        notify_status_change(current_state);
     }
-    void release_search_lock() {
-        is_searching = false;
-    }
+}
 
-    bool is_stop_requested() const { return stop_flag; }
-    void set_stop_requested() { stop_flag = true; }
-
-    // Методы для подписки на события
-    void add_status_observer(std::function<void(bool)> observer) {
-        std::lock_guard<std::mutex> lock(status_observers_mutex);
-        status_observers.push_back(std::move(observer));
-    }
-
-    void add_line_observer(std::function<void(const std::string&)> observer) {
-        std::lock_guard<std::mutex> lock(line_observers_mutex);
-        line_observers.push_back(std::move(observer));
-    }
-
-    // Уведомления
-    void notify_status_change(bool is_open) {
-        std::lock_guard<std::mutex> lock(status_observers_mutex);
-        for (auto& obs : status_observers) obs(is_open);
-    }
-
-    void notify_line_received(const std::string& line) {
-        std::lock_guard<std::mutex> lock(line_observers_mutex);
-        for (auto& obs : line_observers) obs(line);
-    }
-
-    // Проверка и уведомление о смене статуса порта
-    void check_and_notify_status() {
-        bool current_state = port.is_open();
-        if (current_state != was_open) {
-            was_open = current_state;
-            notify_status_change(current_state);
-        }
-    }
-
-    // Остановка всех операций порта
-    void stop() {
-        set_stop_requested();
-        boost::system::error_code ec;
-        port.cancel(ec);   // отменяем все асинхронные операции
-        port.close(ec);    // закрываем порт
-        notify_status_change(false);
-    }
-
-private:
-    net::serial_port port;
-    std::string line_accumulator;
-    std::mutex accum_mutex;
-    char read_buf = 0;
-    bool was_open = false;
-    std::atomic<bool> is_searching{false};
-    std::atomic<bool> stop_flag{false};   // флаг остановки всех операций
-
-    // Наблюдатели
-    std::mutex status_observers_mutex;
-    std::vector<std::function<void(bool)>> status_observers;
-    std::mutex line_observers_mutex;
-    std::vector<std::function<void(const std::string&)>> line_observers;
-};
+// Остановка всех операций порта
+void SerialManager::stop() {
+    set_stop_requested();
+    boost::system::error_code ec;
+    port.cancel(ec);   // отменяем все асинхронные операции
+    port.close(ec);    // закрываем порт
+    notify_status_change(false);
+}
 
 // ----------------------------------------------------------------------
 //  CncSession – WebSocket-сессия для одного фронтенда
 // ----------------------------------------------------------------------
-class CncSession : public std::enable_shared_from_this<CncSession> {
-    websocket::stream<tcp::socket> ws_;
-    SerialManager& sm_;
-    beast::flat_buffer ws_buffer_;
-    std::deque<std::string> write_queue_;
-    std::shared_ptr<net::steady_timer> status_timer_;
-    std::atomic<bool> status_timer_active_{false};
 
-public:
-    CncSession(tcp::socket socket, SerialManager& sm)
-        : ws_(std::move(socket)), sm_(sm) {}
+CncSession::~CncSession() {
+    stop_periodic_status();
+    std::cout << "[L2] Session destroyed" << std::endl;
+}
 
-    void init() {
-        sm_.add_status_observer([weak_self = std::weak_ptr<CncSession>(shared_from_this())](bool is_open) {
-            if (auto self = weak_self.lock())
-                self->send_status(is_open);
-        });
-    }
+void CncSession::init() {
+    sm_.add_status_observer([weak_self = std::weak_ptr<CncSession>(shared_from_this())](bool is_open) {
+        if (auto self = weak_self.lock())
+            self->send_status(is_open);
+    });
+}
 
-    void start() {
-        ws_.async_accept([self = shared_from_this()](beast::error_code ec) {
-            if (ec) {
-                std::cout << "[L2] Accept error: " << ec.message() << std::endl;
-                return;
-            }
-            std::cout << "[L2] Frontend connected" << std::endl;
-            self->send_status(self->sm_.get_port().is_open());
-            self->start_periodic_status();
-            self->do_read_ws();
-        });
-    }
+void CncSession::start() {
+    ws_.async_accept([self = shared_from_this()](beast::error_code ec) {
+        if (ec) {
+            std::cout << "[L2] Accept error: " << ec.message() << std::endl;
+            return;
+        }
+        std::cout << "[L2] Frontend connected" << std::endl;
+        self->send_status(self->sm_.get_port().is_open());
+        self->start_periodic_status();
+        self->do_read_ws();
+    });
+}
 
-    void deliver(const std::string& message) {
-        safe_send(message);
-    }
+void CncSession::deliver(const std::string& message) {
+    safe_send(message);
+}
 
     // Принудительное закрытие сессии (для остановки)
-    void stop() {
-        boost::system::error_code ec;
-        ws_.close(websocket::close_code::normal, ec);
-        stop_periodic_status();
-    }
+void CncSession::stop() {
+    boost::system::error_code ec;
+    ws_.close(websocket::close_code::normal, ec);
+    stop_periodic_status();
+}
 
-private:
-    void send_status(bool port_open) {
-        std::string status_msg = port_open ? "STATUS:READY" : "STATUS:NO_DEVICE";
-        safe_send(std::move(status_msg));
-    }
+void CncSession::send_status(bool port_open) {
+    std::string status_msg = port_open ? "STATUS:READY" : "STATUS:NO_DEVICE";
+    safe_send(std::move(status_msg));
+}
 
-    void safe_send(std::string msg) {
-        auto self = shared_from_this();
-        net::post(ws_.get_executor(), [self, msg = std::move(msg)]() {
-            if (!self->ws_.is_open()) return;
-            bool write_in_progress = !self->write_queue_.empty();
-            self->write_queue_.push_back(std::move(msg));
-            if (!write_in_progress)
+void CncSession::safe_send(std::string msg) {
+    auto self = shared_from_this();
+    net::post(ws_.get_executor(), [self, msg = std::move(msg)]() {
+        if (!self->ws_.is_open()) return;
+        bool write_in_progress = !self->write_queue_.empty();
+        self->write_queue_.push_back(std::move(msg));
+        if (!write_in_progress)
+            self->do_write();
+    });
+}
+
+void CncSession::do_write() {
+    auto self = shared_from_this();
+    ws_.async_write(net::buffer(write_queue_.front()),
+        [self](beast::error_code ec, std::size_t) {
+            if (ec) {
+                std::cout << "[L2] Write error: " << ec.message() << std::endl;
+                return;
+            }
+            self->write_queue_.pop_front();
+            if (!self->write_queue_.empty())
                 self->do_write();
         });
-    }
+}
 
-    void do_write() {
-        auto self = shared_from_this();
-        ws_.async_write(net::buffer(write_queue_.front()),
-            [self](beast::error_code ec, std::size_t) {
-                if (ec) {
-                    std::cout << "[L2] Write error: " << ec.message() << std::endl;
-                    return;
-                }
-                self->write_queue_.pop_front();
-                if (!self->write_queue_.empty())
-                    self->do_write();
-            });
-    }
+void CncSession::start_periodic_status() {
+    if (status_timer_active_.exchange(true))
+        return;
+    schedule_status_timer();
+}
 
-    void start_periodic_status() {
-        if (status_timer_active_.exchange(true))
+void CncSession::schedule_status_timer() {
+    if (!status_timer_active_)
+        return;
+
+    auto self = shared_from_this();
+    status_timer_ = std::make_shared<net::steady_timer>(ws_.get_executor());
+    status_timer_->expires_after(std::chrono::seconds(5));
+    status_timer_->async_wait([self](boost::system::error_code ec) {
+        if (ec == boost::asio::error::operation_aborted)
             return;
-        schedule_status_timer();
-    }
+        if (!ec && self->ws_.is_open() && self->status_timer_active_ && !self->sm_.is_stop_requested()) {
+            self->send_status(self->sm_.get_port().is_open());
+            self->schedule_status_timer();
+        } else {
+            self->status_timer_active_ = false;
+        }
+    });
+}
 
-    void schedule_status_timer() {
-        if (!status_timer_active_)
+void CncSession::stop_periodic_status() {
+    status_timer_active_ = false;
+    if (status_timer_)
+        status_timer_->cancel();
+}
+
+void CncSession::do_read_ws() {
+    ws_.async_read(ws_buffer_, [self = shared_from_this()](beast::error_code ec, std::size_t bytes) {
+        if (ec) {
+            std::cout << "[L2] Frontend disconnected: " << ec.message() << std::endl;
+            self->stop_periodic_status();
             return;
-
-        auto self = shared_from_this();
-        status_timer_ = std::make_shared<net::steady_timer>(ws_.get_executor());
-        status_timer_->expires_after(std::chrono::seconds(5));
-        status_timer_->async_wait([self](boost::system::error_code ec) {
-            if (ec == boost::asio::error::operation_aborted)
-                return;
-            if (!ec && self->ws_.is_open() && self->status_timer_active_ && !self->sm_.is_stop_requested()) {
-                self->send_status(self->sm_.get_port().is_open());
-                self->schedule_status_timer();
-            } else {
-                self->status_timer_active_ = false;
-            }
-        });
-    }
-
-    void stop_periodic_status() {
-        status_timer_active_ = false;
-        if (status_timer_)
-            status_timer_->cancel();
-    }
-
-    void do_read_ws() {
-        ws_.async_read(ws_buffer_, [self = shared_from_this()](beast::error_code ec, std::size_t bytes) {
-            if (ec) {
-                std::cout << "[L2] Frontend disconnected: " << ec.message() << std::endl;
-                self->stop_periodic_status();
-                return;
-            }
-            auto data = self->ws_buffer_.data();
-            if (data.size() == 0) {
-                self->ws_buffer_.consume(bytes);
-                self->do_read_ws();
-                return;
-            }
-            std::string msg = beast::buffers_to_string(data);
+        }
+        auto data = self->ws_buffer_.data();
+        if (data.size() == 0) {
             self->ws_buffer_.consume(bytes);
-            if (msg.empty()) {
-                self->do_read_ws();
-                return;
-            }
-            while (!msg.empty() && (msg.back() == ' ' || msg.back() == '\t'))
-                msg.pop_back();
-            if (!msg.empty() && msg.back() != '\r' && msg.back() != '\n')
-                msg += "\r\n";
-
-            std::cout << "[L3 -> L2] Dispatch: " << msg;
-
-            if (self->sm_.get_port().is_open() && !self->sm_.is_stop_requested()) {
-                try {
-                    std::cout << "[L3 -> L1] Dispatch: " << msg;
-                    auto write_buffer = std::make_shared<std::string>(msg);
-                    net::async_write(self->sm_.get_port(), net::buffer(*write_buffer),
-                        [write_buffer](boost::system::error_code ec, std::size_t) {
-                            if (ec)
-                                std::cerr << "Error writing to serial port: " << ec.message() << std::endl;
-                        });
-                } catch (const std::exception& e) {
-                    std::cerr << "Exception writing to serial port: " << e.what() << std::endl;
-                }
-            } else {
-                std::cout << "[L3] Frontend command ignored (no device or stopping): " << msg;
-            }
             self->do_read_ws();
-        });
-    }
+            return;
+        }
+        std::string msg = beast::buffers_to_string(data);
+        self->ws_buffer_.consume(bytes);
+        if (msg.empty()) {
+            self->do_read_ws();
+            return;
+        }
+        while (!msg.empty() && (msg.back() == ' ' || msg.back() == '\t'))
+            msg.pop_back();
+        if (!msg.empty() && msg.back() != '\r' && msg.back() != '\n')
+            msg += "\r\n";
 
-public:
-    ~CncSession() {
-        stop_periodic_status();
-        std::cout << "[L2] Session destroyed" << std::endl;
-    }
-};
+        std::cout << "[L3 -> L2] Dispatch: " << msg;
+
+        if (self->sm_.get_port().is_open() && !self->sm_.is_stop_requested()) {
+            try {
+                std::cout << "[L3 -> L1] Dispatch: " << msg;
+                auto write_buffer = std::make_shared<std::string>(msg);
+                net::async_write(self->sm_.get_port(), net::buffer(*write_buffer),
+                    [write_buffer](boost::system::error_code ec, std::size_t) {
+                        if (ec)
+                            std::cerr << "Error writing to serial port: " << ec.message() << std::endl;
+                    });
+            } catch (const std::exception& e) {
+                std::cerr << "Exception writing to serial port: " << e.what() << std::endl;
+            }
+        } else {
+            std::cout << "[L3] Frontend command ignored (no device or stopping): " << msg;
+        }
+        self->do_read_ws();
+    });
+}
 
 // ----------------------------------------------------------------------
 //  CncServer – принимает подключения и управляет списком сессий
 // ----------------------------------------------------------------------
-class CncServer : public std::enable_shared_from_this<CncServer> {
-    tcp::acceptor acceptor_;
-    SerialManager& sm_;
-    std::vector<std::weak_ptr<CncSession>> sessions_;
-    std::mutex sessions_mutex_;
-    std::atomic<bool> stop_flag_{false};
+CncServer::CncServer(net::io_context& ioc, SerialManager& sm)
+    : acceptor_(ioc, {net::ip::make_address("0.0.0.0"), 8080}), sm_(sm)
+{
+    do_accept();
+}
 
-public:
-    CncServer(net::io_context& ioc, SerialManager& sm)
-        : acceptor_(ioc, {net::ip::make_address("0.0.0.0"), 8080}), sm_(sm)
-    {
-        do_accept();
+void CncServer::init() {
+    auto self = shared_from_this();
+    sm_.add_line_observer([self](const std::string& line) {
+        if (self && !self->stop_flag_)
+            self->broadcast(line);
+    });
+}
+
+void CncServer::broadcast(const std::string& message) {
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    sessions_.erase(std::remove_if(sessions_.begin(), sessions_.end(),
+        [](const std::weak_ptr<CncSession>& wp) { return wp.expired(); }),
+        sessions_.end());
+
+    for (auto& wp : sessions_) {
+        if (auto session = wp.lock())
+            session->deliver(message);
     }
+}
 
-    void init() {
-        auto self = shared_from_this();
-        sm_.add_line_observer([self](const std::string& line) {
-            if (self && !self->stop_flag_)
-                self->broadcast(line);
-        });
+// Остановка сервера: закрываем acceptor и все сессии
+void CncServer::stop() {
+    stop_flag_ = true;
+    boost::system::error_code ec;
+    acceptor_.close(ec);
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    for (auto& wp : sessions_) {
+        if (auto session = wp.lock())
+            session->stop();
     }
+    sessions_.clear();
+}
 
-    void broadcast(const std::string& message) {
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-        sessions_.erase(std::remove_if(sessions_.begin(), sessions_.end(),
-            [](const std::weak_ptr<CncSession>& wp) { return wp.expired(); }),
-            sessions_.end());
-
-        for (auto& wp : sessions_) {
-            if (auto session = wp.lock())
-                session->deliver(message);
-        }
-    }
-
-    // Остановка сервера: закрываем acceptor и все сессии
-    void stop() {
-        stop_flag_ = true;
-        boost::system::error_code ec;
-        acceptor_.close(ec);
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-        for (auto& wp : sessions_) {
-            if (auto session = wp.lock())
-                session->stop();
-        }
-        sessions_.clear();
-    }
-
-private:
-    void do_accept() {
-        acceptor_.async_accept([this](beast::error_code ec, tcp::socket socket) {
-            if (stop_flag_) return;
-            if (!ec) {
-                auto session = std::make_shared<CncSession>(std::move(socket), sm_);
-                session->init();
-                session->start();
-                {
-                    std::lock_guard<std::mutex> lock(sessions_mutex_);
-                    sessions_.push_back(session);
-                }
+void CncServer::do_accept() {
+    acceptor_.async_accept([this](beast::error_code ec, tcp::socket socket) {
+        if (stop_flag_) return;
+        if (!ec) {
+            auto session = std::make_shared<CncSession>(std::move(socket), sm_);
+            session->init();
+            session->start();
+            {
+                std::lock_guard<std::mutex> lock(sessions_mutex_);
+                sessions_.push_back(session);
             }
-            if (!stop_flag_)
-                do_accept();
-        });
-    }
-};
+        }
+        if (!stop_flag_)
+            do_accept();
+    });
+}
 
 // ----------------------------------------------------------------------
 //  Постоянное асинхронное чтение из последовательного порта (с учётом флага остановки)

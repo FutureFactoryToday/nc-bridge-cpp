@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # но для надежности оставим system)
 find_package(Boost REQUIRED COMPONENTS system)
 
-add_executable(nc_bridge_cpp main.cpp)
+add_executable(nc_bridge_cpp main.cpp main.h)
 
 # Подключаем заголовки и линкуем библиотеки
 target_link_libraries(nc_bridge_cpp 
